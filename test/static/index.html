@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Учёт рабочего времени</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --ink:#1d2330; --muted:#6b7385; --line:#e3e6ec;
+          --accent:#2f5bea; --danger:#d23b3b; --ok:#1f9d55; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+         background:var(--bg); color:var(--ink); }
+  main { max-width:960px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  h2 { font-size:16px; margin:0 0 12px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:12px;
+            padding:16px; margin-bottom:16px; }
+  form, .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  input, select, button { font:inherit; padding:8px 10px; border-radius:8px; border:1px solid var(--line); }
+  input[type=text] { flex:1; min-width:160px; }
+  button { background:var(--accent); color:#fff; border-color:var(--accent); cursor:pointer; }
+  button.secondary { background:#fff; color:var(--ink); border-color:var(--line); }
+  button.stop { background:var(--danger); border-color:var(--danger); }
+  button:disabled { opacity:.5; cursor:default; }
+  .emp { display:grid; grid-template-columns:160px 1fr auto; gap:8px; align-items:center;
+         padding:10px 0; border-top:1px solid var(--line); }
+  .emp:first-of-type { border-top:0; }
+  .emp .name { font-weight:600; }
+  .badge { color:var(--ok); font-variant-numeric:tabular-nums; font-weight:600; }
+  .running-task { color:var(--muted); }
+  table { width:100%; border-collapse:collapse; margin-top:8px; }
+  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; font-size:13px; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .empty { color:var(--muted); padding:14px 0; }
+  #message { position:fixed; left:50%; bottom:20px; transform:translateX(-50%); padding:10px 16px;
+             border-radius:8px; color:#fff; display:none; max-width:90vw; }
+  #message.error { background:var(--danger); } #message.info { background:var(--ok); }
+  @media (max-width:600px) { .emp { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Учёт рабочего времени</h1>
+  <p class="sub">Добавьте сотрудников, запускайте таймер с описанием задачи и смотрите итоги за период.</p>
+
+  <section>
+    <h2>Сотрудники</h2>
+    <form id="add-employee">
+      <input type="text" id="employee-name" placeholder="Имя нового сотрудника" maxlength="100" required>
+      <button type="submit">Добавить</button>
+    </form>
+    <div id="employees"></div>
+  </section>
+
+  <section>
+    <h2>Отчёт за период</h2>
+    <div class="row">
+      <label>С <input type="date" id="from"></label>
+      <label>По <input type="date" id="to"></label>
+      <select id="filter-employee"><option value="">Все сотрудники</option></select>
+      <button class="secondary" data-preset="today" type="button">Сегодня</button>
+      <button class="secondary" data-preset="week" type="button">7 дней</button>
+      <button class="secondary" data-preset="month" type="button">Месяц</button>
+      <button id="show-report" type="button">Показать</button>
+    </div>
+    <div id="report"></div>
+    <div id="entries"></div>
+  </section>
+</main>
+<div id="message"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function fmtDuration(total) {
+  total = Math.max(0, Math.floor(total));
+  const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), s = total % 60;
+  return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+function fmtDateTime(iso) {
+  return iso ? new Date(iso).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" }) : "";
+}
+function el(tag, props = {}, ...children) {   // безопасное создание DOM: текст через textContent
+  const node = document.createElement(tag);
+  Object.assign(node, props);
+  for (const child of children) node.append(child);
+  return node;
+}
+function toast(text, kind = "error") {
+  const box = $("message");
+  box.textContent = text; box.className = kind; box.style.display = "block";
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => (box.style.display = "none"), 3500);
+}
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    headers: { "Content-Type": "application/json" }, ...options,
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Ошибка запроса");
+  return data;
+}
+async function guarded(action) {
+  try { await action(); } catch (err) { toast(err.message); }
+}
+
+// ---------- сотрудники и таймеры ----------
+async function loadEmployees() {
+  const employees = await api("/api/employees");
+  const box = $("employees");
+  box.replaceChildren();
+  if (!employees.length) box.append(el("div", { className: "empty", textContent: "Пока нет сотрудников." }));
+
+  const filter = $("filter-employee"), selected = filter.value;
+  filter.replaceChildren(el("option", { value: "", textContent: "Все сотрудники" }));
+  for (const e of employees) filter.append(el("option", { value: e.id, textContent: e.name }));
+  filter.value = selected;
+
+  for (const e of employees) {
+    const row = el("div", { className: "emp" }, el("div", { className: "name", textContent: e.name }));
+    if (e.running_entry_id) {
+      const clock = el("span", { className: "badge" });
+      clock.dataset.since = e.running_since;
+      row.append(
+        el("div", {}, clock, el("span", { className: "running-task", textContent: "  " + e.running_task })),
+        el("button", { className: "stop", textContent: "Стоп",
+          onclick: () => guarded(async () => { await api("/api/timer/stop", { method: "POST", body: { employee_id: e.id } });
+                                               await refresh(); }) }));
+    } else {
+      const task = el("input", { type: "text", placeholder: "Над чем работаете?", maxLength: 300 });
+      const start = () => guarded(async () => {
+        await api("/api/timer/start", { method: "POST", body: { employee_id: e.id, task: task.value } });
+        await refresh();
+      });
+      task.addEventListener("keydown", (ev) => { if (ev.key === "Enter") start(); });
+      row.append(task, el("button", { textContent: "Старт", onclick: start }));
+    }
+    box.append(row);
+  }
+  tick();
+}
+function tick() {
+  document.querySelectorAll("[data-since]").forEach((node) => {
+    node.textContent = fmtDuration((Date.now() - new Date(node.dataset.since).getTime()) / 1000);
+  });
+}
+setInterval(tick, 1000);
+
+$("add-employee").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  guarded(async () => {
+    await api("/api/employees", { method: "POST", body: { name: $("employee-name").value } });
+    $("employee-name").value = "";
+    await refresh();
+    toast("Сотрудник добавлен", "info");
+  });
+});
+
+// ---------- отчёт ----------
+const pad = (n) => String(n).padStart(2, "0");
+const dateValue = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+
+function setPreset(name) {
+  const today = new Date(), from = new Date(today);
+  if (name === "week") from.setDate(today.getDate() - 6);
+  if (name === "month") from.setDate(1);
+  $("from").value = dateValue(from); $("to").value = dateValue(today);
+}
+document.querySelectorAll("[data-preset]").forEach((b) =>
+  b.addEventListener("click", () => { setPreset(b.dataset.preset); guarded(loadReport); }));
+$("show-report").addEventListener("click", () => guarded(loadReport));
+
+async function loadReport() {
+  if (!$("from").value || !$("to").value) throw new Error("Выберите обе даты периода");
+  // Даты — по локальному времени пользователя; «По» включительно => конец = полночь следующего дня.
+  const start = new Date($("from").value + "T00:00:00");
+  const end = new Date($("to").value + "T00:00:00"); end.setDate(end.getDate() + 1);
+  const qs = new URLSearchParams({ start: start.toISOString(), end: end.toISOString() });
+  const employeeId = $("filter-employee").value;
+  const [report, entries] = await Promise.all([
+    api("/api/report?" + qs),
+    api("/api/entries?" + new URLSearchParams(employeeId ? { start: qs.get("start"), end: qs.get("end"), employee_id: employeeId } : qs)),
+  ]);
+  renderReport(report, employeeId);
+  renderEntries(entries);
+}
+
+function renderReport(report, employeeId) {
+  const box = $("report"); box.replaceChildren();
+  const rows = report.employees.filter((r) => !employeeId || String(r.employee_id) === employeeId);
+  if (!report.entries_count) {
+    box.append(el("div", { className: "empty", textContent: "За выбранный период записей нет." }));
+    return;
+  }
+  const table = el("table", {}, el("tr", {}, el("th", { textContent: "Сотрудник" }),
+    el("th", { className: "num", textContent: "Записей" }), el("th", { className: "num", textContent: "Всего времени" })));
+  for (const r of rows)
+    table.append(el("tr", {}, el("td", { textContent: r.employee }),
+      el("td", { className: "num", textContent: r.entries_count }),
+      el("td", { className: "num", textContent: fmtDuration(r.total_seconds) })));
+  const total = rows.reduce((sum, r) => sum + r.total_seconds, 0);
+  table.append(el("tr", {}, el("td", { textContent: "Итого" }), el("td"),
+    el("td", { className: "num", textContent: fmtDuration(total) })));
+  box.append(table);
+}
+
+function renderEntries(entries) {
+  const box = $("entries"); box.replaceChildren();
+  if (!entries.length) return;
+  box.append(el("h2", { textContent: "Записи", style: "margin-top:20px" }));
+  const table = el("table", {}, el("tr", {}, ...["Сотрудник", "Задача", "Начало", "Конец"].map((t) => el("th", { textContent: t })),
+    el("th", { className: "num", textContent: "Длительность" })));
+  for (const e of entries)
+    table.append(el("tr", {}, el("td", { textContent: e.employee }), el("td", { textContent: e.task }),
+      el("td", { textContent: fmtDateTime(e.started_at) }),
+      el("td", { textContent: e.running ? "идёт…" : fmtDateTime(e.stopped_at) }),
+      el("td", { className: "num", textContent: fmtDuration(e.duration_seconds) })));
+  box.append(table);
+}
+
+async function refresh() {
+  await loadEmployees();
+  if ($("from").value && $("to").value) await loadReport();
+}
+
+setPreset("today");
+guarded(refresh);
+</script>
+</body>
+</html>
